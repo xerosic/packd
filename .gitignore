@@ -37,7 +37,7 @@ bin/
 dist/
 
 # Test folder
-test_folder/
+test_*/
 
 # Test .pakd files
 *.pakd
