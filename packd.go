@@ -5,228 +5,147 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 
 	"github.com/klauspost/compress/zstd"
 )
 
-type PIE [8]byte
-
-type FirstHeader struct {
-	IsEncrypted   [1]byte
-	Miscellaneous [7]byte
-}
-
-type Header struct {
-	PathLength uint16
-	DataLength uint64
-}
-
-type Box struct {
-	BoxHeader Header
-	Path      []byte
-	Data      []byte
-}
-
-type PackdFile struct {
-	PIE         PIE
-	FirstHeader FirstHeader
-	Boxes       []Box
-}
-
-func CreatePackdFileFromDirectory(path string, outputFileName string, isEncrypted bool) {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
-	// Create a new PackdFile
-	pf := PackdFile{}
-
-	// Set the PIE
-	pf.PIE = PIE{0x3C, 0x21, 0x50, 0x41, 0x4B, 0x44, 0x21, 0x3E}
-
-	boxes := []Box{}
-
-	// Set the first header
-	if isEncrypted {
-		pf.FirstHeader.IsEncrypted = [1]byte{0x01}
-	} else {
-		pf.FirstHeader.IsEncrypted = [1]byte{0x00}
-	}
-
-	// Create zstd encoder
-	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer encoder.Close()
-
-	// Iterate each file in the directory and add it to the PackdFile
-	files, err := os.ReadDir(path)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for _, file := range files {
-		// Open the file
-		f, err := os.Open(path + "/" + file.Name())
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// Read the file contents
-		data, err := io.ReadAll(f)
-		if err != nil {
-			log.Fatal(err)
-		}
-		f.Close()
-
-		// Create a new header for the box
-		header := Header{}
-
-		// Set the box header path length
-		header.PathLength = uint16(len(file.Name()))
-
-		// Create a new box
-		box := Box{}
-
-		// Set the box header
-		box.BoxHeader = header
-
-		// Set the box path
-		box.Path = []byte(file.Name())
-
-		// Compress the data
-		compressedData := encoder.EncodeAll(data, nil)
-
-		if bytes.Equal(data, compressedData) {
-			fmt.Printf("File %s was not compressed\n", file.Name())
-		}
-
-		// Set the box header data length
-		header.DataLength = uint64(len(data))
-
-		// Set the box data
-		box.Data = compressedData
-
-		// Append the box to the boxes slice
-		boxes = append(boxes, box)
-
-	}
-
-	// Set the PackdFile boxes
-	pf.Boxes = boxes
-
-	// Create the output file
+func CreatePackdFileFromDirectory(path string, outputFileName string, isEncrypted bool) error {
+	// Initialize output file
 	outFile, err := os.Create(outputFileName)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer outFile.Close()
 
-	// Write PIE
-	if err := binary.Write(outFile, binary.LittleEndian, pf.PIE); err != nil {
-		log.Fatal(err)
+	// Write PIE (magic bytes)
+	if _, err := outFile.Write([]byte{0x3C, 0x21, 0x50, 0x41, 0x4B, 0x44, 0x21, 0x3E}); err != nil {
+		return err
 	}
 
 	// Write FirstHeader
-	if err := binary.Write(outFile, binary.LittleEndian, pf.FirstHeader); err != nil {
-		log.Fatal(err)
+	var firstHeader [8]byte
+	if isEncrypted {
+		firstHeader[0] = 0x01
+	}
+	if _, err := outFile.Write(firstHeader[:]); err != nil {
+		return err
 	}
 
-	// Write each box
-	for _, box := range pf.Boxes {
-		// Write header
-		if err := binary.Write(outFile, binary.LittleEndian, box.BoxHeader); err != nil {
-			log.Fatal(err)
-		}
-
-		// Write path
-		if _, err := outFile.Write(box.Path); err != nil {
-			log.Fatal(err)
-		}
-
-		// Write compressed data
-		if _, err := outFile.Write(box.Data); err != nil {
-			log.Fatal(err)
-		}
+	// Prepare Zstd encoder
+	encoder, err := zstd.NewWriter(nil)
+	if err != nil {
+		return err
 	}
+	defer encoder.Close()
 
-	return
+	// Process directory files
+	return filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
+		if info.IsDir() {
+			return nil
+		}
+
+		// Read file data
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+
+		// Compress data
+		compressed := encoder.EncodeAll(data, nil)
+
+		// Create header
+		header := make([]byte, 10)
+		relPath, _ := filepath.Rel(path, filePath)
+		binary.LittleEndian.PutUint16(header[0:2], uint16(len(relPath)))
+		binary.LittleEndian.PutUint64(header[2:10], uint64(len(compressed)))
+
+		// Write to archive
+		if _, err := outFile.Write(header); err != nil {
+			return err
+		}
+		if _, err := outFile.WriteString(relPath); err != nil {
+			return err
+		}
+		if _, err := outFile.Write(compressed); err != nil {
+			return err
+		}
+
+		return nil
+	})
 }
 
-func ExtractPackdFileToDirectory(inputFileName string, outputPath string) {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-
+func ExtractPackdFileToDirectory(inputFileName string, outputPath string) error {
 	// Open input file
 	inFile, err := os.Open(inputFileName)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer inFile.Close()
 
-	// Create decoder
+	// Verify PIE
+	pie := make([]byte, 8)
+	if _, err := io.ReadFull(inFile, pie); err != nil {
+		return err
+	}
+	if !bytes.Equal(pie, []byte{0x3C, 0x21, 0x50, 0x41, 0x4B, 0x44, 0x21, 0x3E}) {
+		return fmt.Errorf("invalid PIE signature")
+	}
+
+	// Read FirstHeader (skip encryption check for now)
+	if _, err := io.ReadFull(inFile, make([]byte, 8)); err != nil {
+		return err
+	}
+
+	// Prepare Zstd decoder
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer decoder.Close()
 
-	// Read and verify PIE
-	pie := PIE{}
-	if err := binary.Read(inFile, binary.LittleEndian, &pie); err != nil {
-		log.Fatal(err)
-	}
-	expectedPIE := PIE{0x3C, 0x21, 0x50, 0x41, 0x4B, 0x44, 0x21, 0x3E}
-	if pie != expectedPIE {
-		log.Fatal("error: invalid file format (no PIE present / invalid PIE)")
-	}
-
-	// Read FirstHeader
-	firstHeader := FirstHeader{}
-	if err := binary.Read(inFile, binary.LittleEndian, &firstHeader); err != nil {
-		log.Fatal(err)
-	}
-
-	// Create output directory if it doesn't exist
-	if err := os.MkdirAll(outputPath, 0755); err != nil {
-		log.Fatal(err)
-	}
-
-	// Read and extract boxes
+	// Process boxes
+	headerBuf := make([]byte, 10)
 	for {
 		// Read header
-		header := Header{}
-		if err := binary.Read(inFile, binary.LittleEndian, &header); err != nil {
+		if _, err := io.ReadFull(inFile, headerBuf); err != nil {
 			if err == io.EOF {
 				break
 			}
-			log.Fatal(err)
+			return err
 		}
+
+		pathLength := binary.LittleEndian.Uint16(headerBuf[0:2])
+		dataLength := binary.LittleEndian.Uint64(headerBuf[2:10])
+
 		// Read path
-		path := make([]byte, header.PathLength)
+		path := make([]byte, pathLength)
 		if _, err := io.ReadFull(inFile, path); err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("path read failed: %w", err)
 		}
 
 		// Read compressed data
-		compressedData := make([]byte, header.DataLength)
-		if _, err := io.ReadFull(inFile, compressedData); err != nil {
-			log.Fatal(err)
+		compressed := make([]byte, dataLength)
+		if _, err := io.ReadFull(inFile, compressed); err != nil {
+			return fmt.Errorf("data read failed: %w", err)
 		}
 
 		// Decompress data
-		decompressedData, err := decoder.DecodeAll(compressedData, nil)
+		decompressed, err := decoder.DecodeAll(compressed, nil)
 		if err != nil {
-			log.Fatal(err)
-
-			// Write to file
-			outFilePath := filepath.Join(outputPath, string(path))
-			if err := os.WriteFile(outFilePath, decompressedData, 0644); err != nil {
-				log.Fatal(err)
-			}
+			return fmt.Errorf("decompression failed: %w", err)
 		}
 
+		// Write output file
+		outPath := filepath.Join(outputPath, string(path))
+		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(outPath, decompressed, 0644); err != nil {
+			return err
+		}
 	}
-	return
+
+	return nil
 }
