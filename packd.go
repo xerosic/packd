@@ -42,6 +42,10 @@ func CreatePackdFileFromDirectory(path string, outputFileName string, isEncrypte
 
 	// Process directory files
 	return filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
 		if info.IsDir() {
 			return nil
 		}
